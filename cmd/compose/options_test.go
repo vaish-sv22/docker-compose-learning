@@ -1,0 +1,453 @@
+/*
+   Copyright 2023 Docker Compose CLI authors
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
+package compose
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/compose-spec/compose-go/v2/types"
+	"github.com/docker/cli/cli/streams"
+	"go.uber.org/mock/gomock"
+	"gotest.tools/v3/assert"
+
+	"github.com/docker/compose/v5/pkg/mocks"
+)
+
+func TestApplyPlatforms_InferFromRuntime(t *testing.T) {
+	makeProject := func() *types.Project {
+		return &types.Project{
+			Services: types.Services{
+				"test": {
+					Name:  "test",
+					Image: "foo",
+					Build: &types.BuildConfig{
+						Context: ".",
+						Platforms: []string{
+							"linux/amd64",
+							"linux/arm64",
+							"alice/32",
+						},
+					},
+					Platform: "alice/32",
+				},
+			},
+		}
+	}
+
+	t.Run("SinglePlatform", func(t *testing.T) {
+		project := makeProject()
+		assert.NilError(t, applyPlatforms(project, true))
+		assert.DeepEqual(t, types.StringList{"alice/32"}, project.Services["test"].Build.Platforms)
+	})
+
+	t.Run("MultiPlatform", func(t *testing.T) {
+		project := makeProject()
+		assert.NilError(t, applyPlatforms(project, false))
+		assert.DeepEqual(t, types.StringList{"linux/amd64", "linux/arm64", "alice/32"}, project.Services["test"].Build.Platforms)
+	})
+}
+
+func TestApplyPlatforms_DockerDefaultPlatform(t *testing.T) {
+	makeProject := func() *types.Project {
+		return &types.Project{
+			Environment: map[string]string{
+				"DOCKER_DEFAULT_PLATFORM": "linux/amd64",
+			},
+			Services: types.Services{
+				"test": {
+					Name:  "test",
+					Image: "foo",
+					Build: &types.BuildConfig{
+						Context: ".",
+						Platforms: []string{
+							"linux/amd64",
+							"linux/arm64",
+						},
+					},
+				},
+			},
+		}
+	}
+
+	t.Run("SinglePlatform", func(t *testing.T) {
+		project := makeProject()
+		assert.NilError(t, applyPlatforms(project, true))
+		assert.DeepEqual(t, types.StringList{"linux/amd64"}, project.Services["test"].Build.Platforms)
+	})
+
+	t.Run("MultiPlatform", func(t *testing.T) {
+		project := makeProject()
+		assert.NilError(t, applyPlatforms(project, false))
+		assert.DeepEqual(t, types.StringList{"linux/amd64", "linux/arm64"}, project.Services["test"].Build.Platforms)
+	})
+}
+
+func TestApplyPlatforms_UnsupportedPlatform(t *testing.T) {
+	makeProject := func() *types.Project {
+		return &types.Project{
+			Environment: map[string]string{
+				"DOCKER_DEFAULT_PLATFORM": "commodore/64",
+			},
+			Services: types.Services{
+				"test": {
+					Name:  "test",
+					Image: "foo",
+					Build: &types.BuildConfig{
+						Context: ".",
+						Platforms: []string{
+							"linux/amd64",
+							"linux/arm64",
+						},
+					},
+				},
+			},
+		}
+	}
+
+	t.Run("SinglePlatform", func(t *testing.T) {
+		project := makeProject()
+		assert.Error(t, applyPlatforms(project, true),
+			`service "test" build.platforms does not support value set by DOCKER_DEFAULT_PLATFORM: commodore/64`)
+	})
+
+	t.Run("MultiPlatform", func(t *testing.T) {
+		project := makeProject()
+		assert.Error(t, applyPlatforms(project, false),
+			`service "test" build.platforms does not support value set by DOCKER_DEFAULT_PLATFORM: commodore/64`)
+	})
+}
+
+func TestIsRemoteConfig(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	cli := mocks.NewMockCli(ctrl)
+
+	tests := []struct {
+		name        string
+		configPaths []string
+		want        bool
+	}{
+		{
+			name:        "empty config paths",
+			configPaths: []string{},
+			want:        false,
+		},
+		{
+			name:        "local file",
+			configPaths: []string{"docker-compose.yaml"},
+			want:        false,
+		},
+		{
+			name:        "OCI reference",
+			configPaths: []string{"oci://registry.example.com/stack:latest"},
+			want:        true,
+		},
+		{
+			name:        "GIT reference",
+			configPaths: []string{"git://github.com/user/repo.git"},
+			want:        true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := buildOptions{
+				ProjectOptions: &ProjectOptions{
+					ConfigPaths: tt.configPaths,
+				},
+			}
+			got := isRemoteConfig(cli, opts)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestDisplayLocationRemoteStack(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	cli := mocks.NewMockCli(ctrl)
+
+	buf := new(bytes.Buffer)
+	cli.EXPECT().Out().Return(streams.NewOut(buf)).AnyTimes()
+
+	project := &types.Project{
+		Name:       "test-project",
+		WorkingDir: "/tmp/test",
+	}
+
+	options := buildOptions{
+		ProjectOptions: &ProjectOptions{
+			ConfigPaths: []string{"oci://registry.example.com/stack:latest"},
+		},
+	}
+
+	displayLocationRemoteStack(cli, project, options)
+
+	output := buf.String()
+	assert.Equal(t, output, fmt.Sprintf("Your compose stack %q is stored in %q\n", "oci://registry.example.com/stack:latest", "/tmp/test"))
+}
+
+func TestDisplayInterpolationVariables(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	tmpDir := t.TempDir()
+
+	// Create a temporary compose file
+	composeContent := `
+services:
+  app:
+    image: nginx
+    environment:
+      - TEST_VAR=${TEST_VAR:?required}  # required with default
+      - API_KEY=${API_KEY:?}            # required without default
+      - DEBUG=${DEBUG:-true}            # optional with default
+      - UNSET_VAR                       # optional without default
+`
+	composePath := filepath.Join(tmpDir, "docker-compose.yml")
+	assert.NilError(t, os.WriteFile(composePath, []byte(composeContent), 0o644))
+
+	buf := new(bytes.Buffer)
+	cli := mocks.NewMockCli(ctrl)
+	cli.EXPECT().Out().Return(streams.NewOut(buf)).AnyTimes()
+
+	// Create ProjectOptions with the temporary compose file
+	projectOptions := &ProjectOptions{
+		ConfigPaths: []string{composePath},
+	}
+
+	// Set up the context with necessary environment variables
+	t.Setenv("TEST_VAR", "test-value")
+	t.Setenv("API_KEY", "123456")
+
+	// Extract variables from the model
+	info, noVariables, err := extractInterpolationVariablesFromModel(t.Context(), cli, projectOptions, []string{})
+	assert.NilError(t, err)
+	assert.Assert(t, noVariables == false)
+
+	// Display the variables
+	displayInterpolationVariables(cli.Out(), info)
+
+	// Expected output format with proper spacing
+	expected := "\nFound the following variables in configuration:\n" +
+		"VARIABLE   VALUE       SOURCE        REQUIRED   DEFAULT\n" +
+		"API_KEY    123456      environment   yes         \n" +
+		"DEBUG      true       compose file  no         true\n" +
+		"TEST_VAR   test-value  environment   yes         \n"
+
+	// Normalize spaces and newlines for comparison
+	normalizeSpaces := func(s string) string {
+		// Replace multiple spaces with a single space
+		s = strings.Join(strings.Fields(strings.TrimSpace(s)), " ")
+		return s
+	}
+
+	actualOutput := buf.String()
+
+	// Compare normalized strings
+	assert.Equal(t,
+		normalizeSpaces(expected),
+		normalizeSpaces(actualOutput),
+		"\nExpected:\n%s\nGot:\n%s", expected, actualOutput)
+}
+
+func TestExtractInterpolationVariablesFromModelAllowsTemplatedPortFields(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	cli := mocks.NewMockCli(ctrl)
+
+	dir := t.TempDir()
+	composePath := filepath.Join(dir, "compose.yaml")
+	assert.NilError(t, os.WriteFile(composePath, []byte(`
+name: remote-defaults
+services:
+  web:
+    image: nginx
+    ports:
+      - host_ip: "${LXKNS_ADDRESS:-127.0.0.1}"
+        published: "${LXKNS_PORT:-5010}"
+        target: 80
+        protocol: tcp
+`), 0o600))
+
+	projectOptions := &ProjectOptions{
+		ConfigPaths: []string{composePath},
+		ProjectDir:  dir,
+	}
+	info, noVariables, err := extractInterpolationVariablesFromModel(t.Context(), cli, projectOptions, []string{})
+	assert.NilError(t, err)
+	assert.Assert(t, noVariables == false)
+
+	values := map[string]string{}
+	for _, variable := range info {
+		values[variable.name] = variable.defaultValue
+	}
+	assert.Equal(t, values["LXKNS_ADDRESS"], "127.0.0.1")
+	assert.Equal(t, values["LXKNS_PORT"], "5010")
+}
+
+func TestRunVariablesAllowsTemplatedPortFields(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	dir := t.TempDir()
+	composePath := filepath.Join(dir, "compose.yaml")
+	assert.NilError(t, os.WriteFile(composePath, []byte(`
+name: remote-defaults
+services:
+  web:
+    image: nginx
+    ports:
+      - host_ip: "${LXKNS_ADDRESS:-127.0.0.1}"
+        published: "${LXKNS_PORT:-5010}"
+        target: 80
+        protocol: tcp
+`), 0o600))
+
+	buf := new(bytes.Buffer)
+	cli := mocks.NewMockCli(ctrl)
+	cli.EXPECT().Out().Return(streams.NewOut(buf)).AnyTimes()
+
+	opts := configOptions{
+		Format: "json",
+		ProjectOptions: &ProjectOptions{
+			ConfigPaths: []string{composePath},
+			ProjectDir:  dir,
+		},
+	}
+	assert.NilError(t, runVariables(t.Context(), cli, opts, nil))
+
+	output := buf.String()
+	assert.Assert(t, strings.Contains(output, `"LXKNS_ADDRESS"`), output)
+	assert.Assert(t, strings.Contains(output, `"LXKNS_PORT"`), output)
+}
+
+func TestConfirmRemoteIncludes(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	cli := mocks.NewMockCli(ctrl)
+
+	tests := []struct {
+		name       string
+		opts       buildOptions
+		assumeYes  bool
+		userInput  string
+		wantErr    bool
+		errMessage string
+		wantPrompt bool
+		wantOutput string
+	}{
+		{
+			name: "no remote includes",
+			opts: buildOptions{
+				ProjectOptions: &ProjectOptions{
+					ConfigPaths: []string{
+						"docker-compose.yaml",
+						"./local/path/compose.yaml",
+					},
+				},
+			},
+			assumeYes:  false,
+			wantErr:    false,
+			wantPrompt: false,
+		},
+		{
+			name: "assume yes with remote includes",
+			opts: buildOptions{
+				ProjectOptions: &ProjectOptions{
+					ConfigPaths: []string{
+						"oci://registry.example.com/stack:latest",
+						"git://github.com/user/repo.git",
+					},
+				},
+			},
+			assumeYes:  true,
+			wantErr:    false,
+			wantPrompt: false,
+		},
+		{
+			name: "user confirms remote includes",
+			opts: buildOptions{
+				ProjectOptions: &ProjectOptions{
+					ConfigPaths: []string{
+						"oci://registry.example.com/stack:latest",
+						"git://github.com/user/repo.git",
+					},
+				},
+			},
+			assumeYes:  false,
+			userInput:  "y\n",
+			wantErr:    false,
+			wantPrompt: true,
+			wantOutput: "\nWarning: This Compose project includes files from remote sources:\n" +
+				"  - oci://registry.example.com/stack:latest\n" +
+				"  - git://github.com/user/repo.git\n" +
+				"\nRemote includes could potentially be malicious. Make sure you trust the source.\n" +
+				"Do you want to continue? [y/N]: ",
+		},
+		{
+			name: "user rejects remote includes",
+			opts: buildOptions{
+				ProjectOptions: &ProjectOptions{
+					ConfigPaths: []string{
+						"oci://registry.example.com/stack:latest",
+					},
+				},
+			},
+			assumeYes:  false,
+			userInput:  "n\n",
+			wantErr:    true,
+			errMessage: "operation cancelled by user",
+			wantPrompt: true,
+			wantOutput: "\nWarning: This Compose project includes files from remote sources:\n" +
+				"  - oci://registry.example.com/stack:latest\n" +
+				"\nRemote includes could potentially be malicious. Make sure you trust the source.\n" +
+				"Do you want to continue? [y/N]: ",
+		},
+	}
+
+	buf := new(bytes.Buffer)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cli.EXPECT().Out().Return(streams.NewOut(buf)).AnyTimes()
+
+			if tt.wantPrompt {
+				inbuf := io.NopCloser(bytes.NewBufferString(tt.userInput))
+				cli.EXPECT().In().Return(streams.NewIn(inbuf)).AnyTimes()
+			}
+
+			err := confirmRemoteIncludes(cli, tt.opts, tt.assumeYes)
+
+			if tt.wantErr {
+				assert.Error(t, err, tt.errMessage)
+			} else {
+				assert.NilError(t, err)
+			}
+
+			if tt.wantOutput != "" {
+				assert.Equal(t, tt.wantOutput, buf.String())
+			}
+			buf.Reset()
+		})
+	}
+}

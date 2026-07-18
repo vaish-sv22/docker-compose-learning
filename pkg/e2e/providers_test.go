@@ -1,0 +1,169 @@
+/*
+   Copyright 2020 Docker Compose CLI authors
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
+package e2e
+
+import (
+	"bufio"
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+
+	"gotest.tools/v3/assert"
+	"gotest.tools/v3/icmd"
+)
+
+// TestProviderStopHook verifies that "docker compose stop" invokes the provider
+// binary's "stop" subcommand. The example provider writes a sentinel file at
+// PROVIDER_STOP_MARKER when its stop subcommand runs.
+func TestProviderStopHook(t *testing.T) {
+	provider, err := findExecutable("example-provider")
+	assert.NilError(t, err)
+
+	markerFile := filepath.Join(t.TempDir(), "example-provider-stop-marker")
+
+	path := fmt.Sprintf("%s%s%s", os.Getenv("PATH"), string(os.PathListSeparator), filepath.Dir(provider))
+	c := NewParallelCLI(t, WithEnv(
+		"PATH="+path,
+		"PROVIDER_STOP_MARKER="+markerFile,
+	))
+	const projectName = "provider-stop-hook"
+
+	t.Cleanup(func() {
+		_ = os.Remove(markerFile)
+		c.cleanupWithDown(t, projectName)
+	})
+
+	res := c.RunDockerComposeCmd(t, "-f", "fixtures/providers/provider-stop.yaml", "--project-name", projectName, "up", "-d")
+	res.Assert(t, icmd.Success)
+
+	res = c.RunDockerComposeCmd(t, "-f", "fixtures/providers/provider-stop.yaml", "--project-name", projectName, "stop")
+	res.Assert(t, icmd.Success)
+
+	_, statErr := os.Stat(markerFile)
+	assert.NilError(t, statErr, "expected example-provider stop subcommand to write marker file %q", markerFile)
+}
+
+func TestDependsOnMultipleProviders(t *testing.T) {
+	provider, err := findExecutable("example-provider")
+	assert.NilError(t, err)
+
+	path := fmt.Sprintf("%s%s%s", os.Getenv("PATH"), string(os.PathListSeparator), filepath.Dir(provider))
+	c := NewParallelCLI(t, WithEnv("PATH="+path))
+	const projectName = "depends-on-multiple-providers"
+	t.Cleanup(func() {
+		c.cleanupWithDown(t, projectName)
+	})
+
+	res := c.RunDockerComposeCmd(t, "-f", "fixtures/providers/depends-on-multiple-providers.yaml", "--project-name", projectName, "up")
+	res.Assert(t, icmd.Success)
+	env := getEnv(res.Combined())
+	assert.Check(t, slices.Contains(env, "PROVIDER1_URL=https://magic.cloud/provider1"), env)
+	assert.Check(t, slices.Contains(env, "PROVIDER2_URL=https://magic.cloud/provider2"), env)
+}
+
+func TestProviderRawSetEnv(t *testing.T) {
+	provider, err := findExecutable("example-provider")
+	assert.NilError(t, err)
+
+	path := fmt.Sprintf("%s%s%s", os.Getenv("PATH"), string(os.PathListSeparator), filepath.Dir(provider))
+	c := NewParallelCLI(t, WithEnv("PATH="+path))
+	const projectName = "rawsetenv"
+	t.Cleanup(func() {
+		c.cleanupWithDown(t, projectName)
+	})
+
+	res := c.RunDockerComposeCmd(t, "-f", "fixtures/providers/rawsetenv.yaml", "--project-name", projectName, "up")
+	res.Assert(t, icmd.Success)
+	env := getEnv(res.Combined())
+	// setenv: prefixed with service name
+	assert.Check(t, slices.Contains(env, "SECRETS_URL=https://magic.cloud/secrets"), env)
+	// rawsetenv: injected as-is without prefix
+	assert.Check(t, slices.Contains(env, "CLOUD_REGION=us-east-1"), env)
+}
+
+func TestProviderRawSetEnvOverridesUserEnv(t *testing.T) {
+	provider, err := findExecutable("example-provider")
+	assert.NilError(t, err)
+
+	path := fmt.Sprintf("%s%s%s", os.Getenv("PATH"), string(os.PathListSeparator), filepath.Dir(provider))
+	c := NewParallelCLI(t, WithEnv("PATH="+path))
+	const projectName = "rawsetenv-override"
+	t.Cleanup(func() {
+		c.cleanupWithDown(t, projectName)
+	})
+
+	res := c.RunDockerComposeCmd(t, "-f", "fixtures/providers/rawsetenv-override.yaml", "--project-name", projectName, "up")
+	res.Assert(t, icmd.Success)
+	env := getEnv(res.Combined())
+	// rawsetenv overrides a user-defined environment variable
+	assert.Check(t, slices.Contains(env, "CLOUD_REGION=us-east-1"), env)
+	assert.Check(t, !slices.Contains(env, "CLOUD_REGION=user-defined-region"), env)
+	// the override is surfaced to the user rather than happening silently
+	assert.Check(t, strings.Contains(res.Combined(), "overrides environment variable"), res.Combined())
+}
+
+func TestProviderRawSetEnvOverridesInheritedEnv(t *testing.T) {
+	provider, err := findExecutable("example-provider")
+	assert.NilError(t, err)
+
+	path := fmt.Sprintf("%s%s%s", os.Getenv("PATH"), string(os.PathListSeparator), filepath.Dir(provider))
+	c := NewParallelCLI(t, WithEnv("PATH="+path))
+	const projectName = "rawsetenv-inherit"
+	t.Cleanup(func() {
+		c.cleanupWithDown(t, projectName)
+	})
+
+	res := c.RunDockerComposeCmd(t, "-f", "fixtures/providers/rawsetenv-inherit.yaml", "--project-name", projectName, "up")
+	res.Assert(t, icmd.Success)
+	env := getEnv(res.Combined())
+	assert.Check(t, slices.Contains(env, "CLOUD_REGION=us-east-1"), env)
+	assert.Check(t, strings.Contains(res.Combined(), "overrides environment variable"), res.Combined())
+}
+
+func TestProviderRawSetEnvOverridesInheritedEnvMapForm(t *testing.T) {
+	provider, err := findExecutable("example-provider")
+	assert.NilError(t, err)
+
+	path := fmt.Sprintf("%s%s%s", os.Getenv("PATH"), string(os.PathListSeparator), filepath.Dir(provider))
+	c := NewParallelCLI(t, WithEnv("PATH="+path))
+	const projectName = "rawsetenv-inherit-map"
+	t.Cleanup(func() {
+		c.cleanupWithDown(t, projectName)
+	})
+
+	res := c.RunDockerComposeCmd(t, "-f", "fixtures/providers/rawsetenv-inherit-map.yaml", "--project-name", projectName, "up")
+	res.Assert(t, icmd.Success)
+	env := getEnv(res.Combined())
+	assert.Check(t, slices.Contains(env, "CLOUD_REGION=us-east-1"), env)
+	assert.Check(t, strings.Contains(res.Combined(), "overrides environment variable"), res.Combined())
+}
+
+func getEnv(out string) []string {
+	var env []string
+	scanner := bufio.NewScanner(strings.NewReader(out))
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "test-1  | ") {
+			env = append(env, line[10:])
+		}
+	}
+	slices.Sort(env)
+	return env
+}
