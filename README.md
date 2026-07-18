@@ -75,18 +75,17 @@ services:
       - .:/code
   redis:
     image: redis
-```
+-----------
+Technology used
+Language: Go (Golang)
+Platform: Docker
+Type: Command-line tool (CLI)
+Purpose: Container orchestration for development
 
-Contributing
-------------
-
-Want to help develop Docker Compose? Check out our
-[contributing documentation](CONTRIBUTING.md).
-
-If you find an issue, please report it on the
-[issue tracker](https://github.com/docker/compose/issues/new/choose).
+-----------
 
 Legacy
 -------------
 
-The Python version of Compose is available under the `v1` [branch](https://github.com/docker/compose/tree/v1).
+Older versions of Docker Compose were written in Python. The current version is written in Go.
+
