@@ -51,6 +51,19 @@ Or copy it into one of these folders to install it system-wide:
 
 (might require making the downloaded file executable with `chmod +x`)
 
+-----
+
+## ✨ Features
+
+- Define multi-container applications using a single YAML file.
+- Start and stop all services with one command.
+- Automatic network creation between containers.
+- Volume management for persistent data.
+- Environment variable support.
+- Service dependency management.
+- Build custom Docker images.
+- Easy scaling of services.
+--------
 
 Quick Start
 -----------
