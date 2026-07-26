@@ -63,7 +63,19 @@ Or copy it into one of these folders to install it system-wide:
 - Service dependency management.
 - Build custom Docker images.
 - Easy scaling of services.
+  
 --------
+
+## Use Cases
+
+- Local development
+- Microservices
+- Web application deployment
+- Database management
+- CI/CD pipelines
+- Testing environments
+  
+---------
 
 ## Quick Start
 
@@ -87,25 +99,14 @@ services:
       - .:/code
   redis:
     image: redis
------------
+------------
 Technology used
 Language: Go (Golang)
 Platform: Docker
 Type: Command-line tool (CLI)
 Purpose: Container orchestration for development
 
------
-
-## Use Cases
-
-- Local development
-- Microservices
-- Web application deployment
-- Database management
-- CI/CD pipelines
-- Testing environments
-
------------
+-------------
 
 Legacy
 -------------
